@@ -1,0 +1,62 @@
+import time
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableParallel
+
+llm = ChatOpenAI(
+    base_url="https://ws-05.huannago.com/v1",
+    api_key="vllm-token",
+    model="Qwen/Qwen2-7B-Instruct",
+    temperature=0,
+    max_tokens=50,
+    request_timeout=120
+)
+
+ig_prompt = ChatPromptTemplate.from_template(
+    "請用 IG 網紅風格寫一篇貼文，主題是：{topic}"
+)
+
+linkedin_prompt = ChatPromptTemplate.from_template(
+    "請用 LinkedIn 專業風格寫一篇貼文，主題是：{topic}"
+)
+
+ig_chain = ig_prompt | llm
+linkedin_chain = linkedin_prompt | llm
+
+parallel_chain = RunnableParallel(
+    instagram=ig_chain,
+    linkedin=linkedin_chain
+)
+
+
+ig_chain_batch = ig_prompt | llm | StrOutputParser()
+linkedin_chain_batch = linkedin_prompt | llm | StrOutputParser()
+
+parallel_chain_batch = RunnableParallel(
+    instagram=ig_chain_batch,
+    linkedin=linkedin_chain_batch
+)
+
+if __name__ == "__main__":
+    topic = {"topic": input("輸入主題：")}
+
+    print("\n=== Streaming 輸出 ===")
+    start = time.time()
+
+    for chunk in parallel_chain.stream(topic):
+        for key, value in chunk.items():
+            if value.content:
+                print(f"[{key}] {value.content}", end="", flush=True)
+    print(f"Streaming 耗時：{time.time() - start:.2f} 秒\n")
+
+    print("\n=== Batch 輸出 ===")
+    start = time.time()
+    result = parallel_chain_batch.invoke(topic)
+
+    print(f"耗時：{time.time() - start:.2f} 秒\n")
+    print("\n【LinkedIn 專家說】：")
+    print(result["linkedin"])
+
+    print("\n【IG 網紅說】：")
+    print(result["instagram"])
