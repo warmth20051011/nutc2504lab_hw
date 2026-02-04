@@ -1,18 +1,18 @@
 import time
 import requests
-from typing import TypedDict
 from pathlib import Path
-
+from typing import TypedDict
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
 
+# ================== 基本設定 ==================
 BASE = "https://3090api.huannago.com"
 CREATE_URL = f"{BASE}/api/v1/subtitle/tasks"
 AUTH = ("nutc2504", "nutc2504")
 
-WAV_PATH = "./Podcast_EP14_30s.wav"
+AUDIO_PATH = "./Podcast_EP14_30s.wav"
 
 OUT_DIR = Path("./out")
 OUT_DIR.mkdir(exist_ok=True)
@@ -25,112 +25,122 @@ llm = ChatOpenAI(
 )
 
 
+# ================== State ==================
 class MeetingState(TypedDict):
-    audio_path: str
-    transcript: str
-    minutes: str
+    srt: str
+    timeline: str
     summary: str
-    final_report: str
+    final: str
 
-def wait_download(url: str, max_tries=300):
+
+# ================== ASR 工具 ==================
+def wait_download(url: str, max_tries=600):
     for _ in range(max_tries):
-        r = requests.get(url, timeout=(5, 60), auth=AUTH)
-        if r.status_code == 200:
-            return r.text
+        try:
+            r = requests.get(url, timeout=(5, 60), auth=AUTH)
+            if r.status_code == 200:
+                return r.text
+        except requests.exceptions.ReadTimeout:
+            pass
         time.sleep(2)
     raise TimeoutError("ASR timeout")
 
 
+# ================== Node 1：ASR ==================
 def asr_node(state: MeetingState):
-    print("\n🎧 [ASR] 上傳音檔，建立任務")
-    with open(state["audio_path"], "rb") as f:
+    print("\n🎧 [ASR] 上傳音檔")
+
+    with open(AUDIO_PATH, "rb") as f:
         r = requests.post(CREATE_URL, files={"audio": f}, auth=AUTH)
     r.raise_for_status()
-    task_id = r.json()["id"]
 
-    print(f"🆔 [ASR] task_id = {task_id}")
-    print("⏳ [ASR] 等待轉錄完成...")
+    task_id = r.json()["id"]
+    print(f"🆔 task_id = {task_id}")
 
     srt_url = f"{BASE}/api/v1/subtitle/tasks/{task_id}/subtitle?type=SRT"
-    transcript = wait_download(srt_url)
+    srt_text = wait_download(srt_url)
 
-    print("✅ [ASR] 完成")
-    return {"transcript": transcript}
-
-
-def minutes_node(state: MeetingState):
-    print("\n📝 [Minutes] 整理詳細逐字稿")
-    minutes = llm.invoke(f"""
-請將以下逐字稿整理成【詳細逐字會議紀錄】：
-- 依時間順序
-- 保留時間軸
-- 使用 Markdown 表格
-
-{state['transcript']}
-""").content
-    print("✅ [Minutes] 完成")
-    return {"minutes": minutes}
+    return {"srt": srt_text}
 
 
+# ================== Node 2：Timeline ==================
+def timeline_node(state: MeetingState):
+    print("\n🕒 [Timeline] 產生含時間軸逐字稿")
 
+    prompt = f"""
+請將以下 SRT 內容整理成【時間軸逐字稿】：
+- 保留所有時間碼
+- 不要摘要
+- 純文字、依時間順序
+
+{state['srt']}
+"""
+
+    timeline = llm.invoke(prompt).content
+    return {"timeline": timeline}
+
+
+# ================== Node 3：Summary ==================
 def summary_node(state: MeetingState):
-    print("\n📌 [Summary] 產出重點摘要")
-    summary = llm.invoke(f"""
-請將以下會議內容整理成【重點摘要】：
-- 會議主題
-- 核心重點
-- 結論
-- Action Items
+    print("\n📌 [Summary] 產生重點摘要")
 
-{state['transcript']}
-""").content
-    print("✅ [Summary] 完成")
+    prompt = f"""
+請根據以下內容產生【重點摘要】：
+- 主題
+- 核心重點（條列）
+- 結論
+
+{state['srt']}
+"""
+
+    summary = llm.invoke(prompt).content
     return {"summary": summary}
 
 
-def join_node(state: MeetingState):
-    return {}
-
-
+# ================== Node 4：Writer ==================
 def writer_node(state: MeetingState):
-    print("\n🧩 [Writer] 整合最終輸出")
-    final = f"""
-# 📋 智慧會議記錄
+    print("\n🧩 [Writer] 輸出結果")
 
-## 一、重點摘要
-{state['summary']}
+    timeline_path = OUT_DIR / "timeline.txt"
+    summary_path = OUT_DIR / "summary.txt"
 
----
+    timeline_path.write_text(state["timeline"], encoding="utf-8")
+    summary_path.write_text(state["summary"], encoding="utf-8")
 
-## 二、詳細逐字會議紀錄
-{state['minutes']}
-"""
-    return {"final_report": final}
+    print("\n=====【重點摘要】=====\n")
+    print(state["summary"])
 
+    print("\n=====【詳細逐字稿（含時間軸）】=====\n")
+    print(state["timeline"])
 
+    print(f"\n✅ 已輸出檔案：")
+    print(f" - {timeline_path}")
+    print(f" - {summary_path}")
 
+    return {"final": "done"}
+
+# ================== LangGraph ==================
 graph = StateGraph(MeetingState)
 
 graph.add_node("asr", asr_node)
-graph.add_node("minutes_taker", minutes_node)
-graph.add_node("summarizer", summary_node)
-graph.add_node("join", join_node)
+graph.add_node("timeline", timeline_node)
+graph.add_node("summary", summary_node)
 graph.add_node("writer", writer_node)
 
 graph.set_entry_point("asr")
 
-graph.add_edge("asr", "minutes_taker")
-graph.add_edge("asr", "summarizer")
-graph.add_edge("minutes_taker", "join")
-graph.add_edge("summarizer", "join")
-graph.add_edge("join", "writer")
+# 👇 關鍵結構（跟圖片一樣）
+graph.add_edge("asr", "timeline")
+graph.add_edge("asr", "summary")
+graph.add_edge("timeline", "writer")
+graph.add_edge("summary", "writer")
 graph.add_edge("writer", END)
 
 app = graph.compile()
 
 
-
-print("\n📊 LangGraph 結構：")
+# ================== Graph 結構顯示 ==================
+print("\n📐 LangGraph 結構：")
 try:
     print(app.get_graph().draw_ascii())
 except ImportError:
@@ -139,7 +149,7 @@ except ImportError:
             |
            asr
           /   \\
- minutes_taker  summarizer
+     timeline summary
           \\   /
           writer
             |
@@ -147,28 +157,13 @@ except ImportError:
     """)
 
 
-
-
+# ================== 執行 ==================
 result = app.invoke({
-    "audio_path": WAV_PATH,
-    "transcript": "",
-    "minutes": "",
+    "srt": "",
+    "timeline": "",
     "summary": "",
-    "final_report": ""
+    "final": ""
 })
 
-(Path("./out/transcript.srt")).write_text(result["transcript"], encoding="utf-8")
-(Path("./out/minutes.md")).write_text(result["minutes"], encoding="utf-8")
-(Path("./out/summary.md")).write_text(result["summary"], encoding="utf-8")
-(Path("./out/final_report.md")).write_text(result["final_report"], encoding="utf-8")
-
-
-
-print("\n🎉 任務完成！輸出如下：\n")
-
-print("=====【重點摘要】=====\n")
-print(result["summary"])
-
-print("\n=====【詳細逐字稿（完整）】=====\n")
-print(result["transcript"])
+print("\n🎉 任務完成")
 
