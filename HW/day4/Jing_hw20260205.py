@@ -1,19 +1,20 @@
 import requests
-import json
 import time
-import os
 import base64
+
+from typing import TypedDict, Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from playwright.sync_api import sync_playwright
 
+from langgraph.graph import StateGraph, END
 
 SEARXNG_URL = "https://puli-8080.huannago.com/search"
 
 
-def search_searxng(query: str, time_range: str = None, limit: int = 3):
-    print(f"🔍 正在搜尋: {query} (範圍: {time_range if time_range else '全部'})")
+def search_searxng(query: str, time_range: str = None, limit: int = 1):
+    print(f"🔍 正在搜尋: {query}")
 
     params = {
         "q": query,
@@ -21,19 +22,19 @@ def search_searxng(query: str, time_range: str = None, limit: int = 3):
         "language": "zh-TW"
     }
 
-    if time_range and time_range != "all":
+    if time_range:
         params["time_range"] = time_range
 
     try:
-        response = requests.get(SEARXNG_URL, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        results = data.get("results", [])
-        return [r for r in results if "url" in r][:limit]
-
+        res = requests.get(SEARXNG_URL, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        return [r for r in data.get("results", []) if "url" in r][:limit]
     except Exception as e:
-        print(f"❌ 搜尋失敗: {e}")
+        print("❌ 搜尋失敗:", e)
         return []
+
+SEARXNG_URL = "https://puli-8080.huannago.com/search"
 
 
 llm = ChatOpenAI(
@@ -43,8 +44,43 @@ llm = ChatOpenAI(
     temperature=0
 )
 
+class QAState(TypedDict):
+    question: str
+    query: Optional[str]
+    url: Optional[str]
+    title: Optional[str]
+    answer: Optional[str]
+    
+    
+def check_cache(state: QAState) -> str:
+    return "planner"
 
-def vlm_read_website(url: str, title: str = "網頁內容") -> str:
+
+def planner(state: QAState) -> str:
+    return "query_gen"
+    
+def query_gen(state: QAState) -> QAState:
+    print("✏️ query_gen：產生搜尋關鍵字")
+    return {
+        **state,
+        "query": state["question"]
+    }
+    
+def search_tool(state: QAState) -> QAState:
+    print("🔍 search_tool：呼叫 SearXNG")
+
+    results = search_searxng(state["query"], time_range="day", limit=1)
+    if not results:
+        return {**state, "answer": "找不到搜尋結果"}
+
+    first = results[0]
+    return {
+        **state,
+        "url": first["url"],
+        "title": first.get("title", "搜尋結果")
+    }
+    
+def vlm_read_website(url: str, title: str) -> str:
     print(f"[VLM] 啟動視覺閱讀: {url}")
 
     screenshots = []
@@ -74,7 +110,6 @@ def vlm_read_website(url: str, title: str = "網頁內容") -> str:
 
                 img = base64.b64encode(page.screenshot()).decode("utf-8")
                 screenshots.append(img)
-
                 print(f" - 截圖 {i+1} 完成 (Scroll: {scroll_y})")
 
             browser.close()
@@ -82,70 +117,73 @@ def vlm_read_website(url: str, title: str = "網頁內容") -> str:
     except Exception as e:
         return f"❌ 截圖失敗: {e}"
 
-
     print(f"[LLM] 正在分析 {len(screenshots)} 張圖片...")
 
-    per_image_results = []
-
-
-    for idx, img in enumerate(screenshots):
-        msg = [
-            HumanMessage(content=[
-                {
-                    "type": "text",
-                    "text": f"這是一張網頁截圖，請擷取與「{title}」相關的重點資訊。"
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{img}"
-                    }
-                }
-            ])
-        ]
-
-        try:
-            result = llm.invoke(msg).content
-            per_image_results.append(result)
-        except Exception as e:
-            per_image_results.append(f"分析失敗: {e}")
-
-    summary_msg = [
-        HumanMessage(content=f"""
-請根據以下多張網頁截圖的分析內容，整理一份完整的重點摘要：
-
-{chr(10).join(per_image_results)}
-""")
+    msgs = [
+        HumanMessage(content=[
+            {"type": "text", "text": f"這是網頁截圖，請整理與「{title}」相關的重點。"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshots[0]}"}}
+        ])
     ]
 
-    try:
-        return llm.invoke(summary_msg).content
-    except Exception as e:
-        return f"彙整失敗: {e}"
+    return llm.invoke(msgs).content
 
+
+
+def final_answer(state: QAState) -> QAState:
+    print("📝 final_answer：VLM 閱讀網頁")
+
+    if not state.get("url"):
+        return state
+
+    answer = vlm_read_website(state["url"], state["title"])
+    return {**state, "answer": answer}
+
+
+workflow = StateGraph(QAState)
+
+workflow.add_node("check_cache", lambda s: s)
+workflow.add_node("query_gen", query_gen)
+workflow.add_node("search_tool", search_tool)
+workflow.add_node("final_answer", final_answer)
+
+workflow.set_entry_point("check_cache")
+
+workflow.add_conditional_edges(
+    "check_cache",
+    check_cache,
+    {
+        "planner": "query_gen",
+    }
+)
+
+workflow.add_conditional_edges(
+    "query_gen",
+    planner,
+    {
+        "query_gen": "search_tool",
+    }
+)
+
+workflow.add_edge("search_tool", "final_answer")
+workflow.add_edge("final_answer", END)
+
+app = workflow.compile()
+print(app.get_graph().draw_ascii())
 
 if __name__ == "__main__":
     question = input("請輸入要查詢的問題：")
 
-    start_time = time.time()
-
-    results = search_searxng(question, time_range="day", limit=1)
-    if not results:
-        print("找不到搜尋結果")
-        exit()
-
-    first = results[0]
-    url = first["url"]
-    title = first.get("title", "搜尋結果")
-
-    print("✏️ query_gen：產生搜尋關鍵字")
-    print("🔍 search_tool：呼叫 SearXNG")
-    print("📝 final_answer：VLM 閱讀網頁")
-
-    answer = vlm_read_website(url, title)
+    result = app.invoke({
+        "question": question,
+        "query": None,
+        "url": None,
+        "title": None,
+        "answer": None
+    })
 
     print("\n" + "=" * 40)
     print("📌 最終回答：")
-    print(answer)
-    print(f"\n⏱️ 總耗時：{time.time() - start_time:.2f} 秒")
+    print(result.get("answer"))
+
 
