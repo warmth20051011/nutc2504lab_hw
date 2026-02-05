@@ -1,6 +1,7 @@
 import requests
 import time
 import base64
+import uuid
 
 from typing import TypedDict, Optional
 
@@ -9,9 +10,26 @@ from langchain_core.messages import HumanMessage
 from playwright.sync_api import sync_playwright
 
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+
+
+# ============================================================
+# 基本設定
+# ============================================================
 
 SEARXNG_URL = "https://puli-8080.huannago.com/search"
 
+llm = ChatOpenAI(
+    base_url="https://ws-02.wade0426.me/v1",
+    api_key="",
+    model="google/gemma-3-27b-it",
+    temperature=0
+)
+
+
+# ============================================================
+# 工具：搜尋
+# ============================================================
 
 def search_searxng(query: str, time_range: str = None, limit: int = 1):
     print(f"🔍 正在搜尋: {query}")
@@ -34,15 +52,10 @@ def search_searxng(query: str, time_range: str = None, limit: int = 1):
         print("❌ 搜尋失敗:", e)
         return []
 
-SEARXNG_URL = "https://puli-8080.huannago.com/search"
 
-
-llm = ChatOpenAI(
-    base_url="https://ws-02.wade0426.me/v1",
-    api_key="",
-    model="google/gemma-3-27b-it",
-    temperature=0
-)
+# ============================================================
+# State 定義
+# ============================================================
 
 class QAState(TypedDict):
     question: str
@@ -50,22 +63,33 @@ class QAState(TypedDict):
     url: Optional[str]
     title: Optional[str]
     answer: Optional[str]
-    
-    
-def check_cache(state: QAState) -> str:
-    return "planner"
 
 
-def planner(state: QAState) -> str:
+# ============================================================
+# Nodes
+# ============================================================
+
+def check_cache_node(state: QAState) -> QAState:
+    # 目前沒有真的 cache，單純當入口
+    return state
+
+
+def route_from_cache(state: QAState) -> str:
     return "query_gen"
-    
+
+
 def query_gen(state: QAState) -> QAState:
     print("✏️ query_gen：產生搜尋關鍵字")
     return {
         **state,
         "query": state["question"]
     }
-    
+
+
+def route_from_query(state: QAState) -> str:
+    return "search_tool"
+
+
 def search_tool(state: QAState) -> QAState:
     print("🔍 search_tool：呼叫 SearXNG")
 
@@ -79,7 +103,8 @@ def search_tool(state: QAState) -> QAState:
         "url": first["url"],
         "title": first.get("title", "搜尋結果")
     }
-    
+
+
 def vlm_read_website(url: str, title: str) -> str:
     print(f"[VLM] 啟動視覺閱讀: {url}")
 
@@ -103,21 +128,18 @@ def vlm_read_website(url: str, title: str) -> str:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(1500)
 
-            for i in range(1):
-                scroll_y = i * 1000
-                page.evaluate(f"window.scrollTo(0, {scroll_y})")
-                page.wait_for_timeout(1500)
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(1500)
 
-                img = base64.b64encode(page.screenshot()).decode("utf-8")
-                screenshots.append(img)
-                print(f" - 截圖 {i+1} 完成 (Scroll: {scroll_y})")
+            img = base64.b64encode(page.screenshot()).decode("utf-8")
+            screenshots.append(img)
 
             browser.close()
 
     except Exception as e:
         return f"❌ 截圖失敗: {e}"
 
-    print(f"[LLM] 正在分析 {len(screenshots)} 張圖片...")
+    print("[LLM] 正在分析截圖...")
 
     msgs = [
         HumanMessage(content=[
@@ -127,7 +149,6 @@ def vlm_read_website(url: str, title: str) -> str:
     ]
 
     return llm.invoke(msgs).content
-
 
 
 def final_answer(state: QAState) -> QAState:
@@ -140,9 +161,13 @@ def final_answer(state: QAState) -> QAState:
     return {**state, "answer": answer}
 
 
+# ============================================================
+# LangGraph 建立（✅ 重點改在這）
+# ============================================================
+
 workflow = StateGraph(QAState)
 
-workflow.add_node("check_cache", lambda s: s)
+workflow.add_node("check_cache", check_cache_node)
 workflow.add_node("query_gen", query_gen)
 workflow.add_node("search_tool", search_tool)
 workflow.add_node("final_answer", final_answer)
@@ -151,39 +176,70 @@ workflow.set_entry_point("check_cache")
 
 workflow.add_conditional_edges(
     "check_cache",
-    check_cache,
+    route_from_cache,
     {
-        "planner": "query_gen",
+        "query_gen": "query_gen",
     }
 )
 
 workflow.add_conditional_edges(
     "query_gen",
-    planner,
+    route_from_query,
     {
-        "query_gen": "search_tool",
+        "search_tool": "search_tool",
     }
 )
 
 workflow.add_edge("search_tool", "final_answer")
 workflow.add_edge("final_answer", END)
 
-app = workflow.compile()
+# ✅ 關鍵：加上 checkpointer，讓它能長期運行
+checkpointer = MemorySaver()
+
+app = workflow.compile(
+    checkpointer=checkpointer
+)
+
 print(app.get_graph().draw_ascii())
 
+
+# ============================================================
+# 主程式（✅ 正確 invoke）
+# ============================================================
+
 if __name__ == "__main__":
-    question = input("請輸入要查詢的問題：")
+    while True:
+        try:
+            question = input("\n請輸入要查詢的問題（q 離開）：").strip()
+            if not question:
+                continue
+            if question.lower() == "q":
+                break
 
-    result = app.invoke({
-        "question": question,
-        "query": None,
-        "url": None,
-        "title": None,
-        "answer": None
-    })
+            thread_id = str(uuid.uuid4())
 
-    print("\n" + "=" * 40)
-    print("📌 最終回答：")
-    print(result.get("answer"))
+            result = app.invoke(
+                {
+                    "question": question,
+                    "query": None,
+                    "url": None,
+                    "title": None,
+                    "answer": None
+                },
+                config={
+                    "configurable": {
+                        "thread_id": thread_id
+                    },
+                    "recursion_limit": 20
+                }
+            )
 
+            print("\n" + "=" * 40)
+            print("📌 最終回答：")
+            print(result.get("answer"))
+            print("=" * 40)
+
+        except KeyboardInterrupt:
+            print("\n👋 中斷結束")
+            break
 
