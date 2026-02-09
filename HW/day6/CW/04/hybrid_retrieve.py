@@ -8,7 +8,7 @@ client = QdrantClient(url=QDRANT_URL)
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-def hybrid_retrieve(query: str, top_k: int = 5):
+def hybrid_retrieve(query: str, top_k: int = 5, top_n: int = 3):
     """
     Dense + Sparse (BM25) Hybrid Search with RRF
     """
@@ -16,8 +16,9 @@ def hybrid_retrieve(query: str, top_k: int = 5):
     # Dense embedding
     query_vec = embedder.encode(query).tolist()
 
-    response = client.query_points(
+    result = client.query_points(
         collection_name=COLLECTION,
+
         prefetch=[
             models.Prefetch(
                 query=models.Document(
@@ -25,19 +26,23 @@ def hybrid_retrieve(query: str, top_k: int = 5):
                     model="Qdrant/bm25"
                 ),
                 using="sparse",
-                limit=top_k * 2,
+                limit=top_k
             ),
             models.Prefetch(
                 query=query_vec,
                 using="dense",
-                limit=top_k * 2,
+                limit=top_k
             ),
         ],
+
+
         query=models.FusionQuery(
             fusion=models.Fusion.RRF
         ),
-        limit=top_k
+
+        limit=top_n,
+        with_payload=True
     )
 
-    return [p.payload["text"] for p in response.points]
+    return [p.payload["text"] for p in result.points]
 
