@@ -5,34 +5,31 @@ from docling.datamodel.pipeline_options import (
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
-
-def main():
-    # === OCR Pipeline 設定 ===
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
-    pipeline_options.ocr_options = RapidOcrOptions(
-        force_full_page_ocr=True
+# === OCR Pipeline 設定（IDP 流程）===
+pipeline_options = PdfPipelineOptions(
+    do_ocr=True,
+    ocr_options=RapidOcrOptions(
+        lang=["ch", "en"]
     )
+)
 
-    # === 建立 Converter ===
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(
-                pipeline_options=pipeline_options
-            )
-        }
-    )
+doc_converter = DocumentConverter(
+    format_options={
+        InputFormat.PDF: PdfFormatOption(
+            pipeline_options=pipeline_options
+        )
+    }
+)
 
-    # === 轉換 PDF ===
-    result = converter.convert("sample_table.pdf")
+# === 轉換 PDF ===
+result = doc_converter.convert("sample_table.pdf")
 
-    # === 輸出 Markdown ===
-    with open("output_rapidocr.md", "w", encoding="utf-8") as f:
-        f.write(result.document.export_to_markdown())
+# === 匯出成 Markdown ===
+md_text = result.document.export_to_markdown()
 
-    print("✅ RapidOCR → Markdown 完成")
+# === 寫入 md 檔案 ===
+with open("output_rapidocr.md", "w", encoding="utf-8") as f:
+    f.write(md_text)
 
-
-if __name__ == "__main__":
-    main()
+print("✅ 已成功產出 output_rapidocr.md")
 
